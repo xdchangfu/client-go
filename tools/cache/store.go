@@ -54,6 +54,7 @@ type Store interface {
 	ListKeys() []string
 
 	// Get returns the accumulator associated with the given object's key
+	// 返回obj相同对象键的对象，对象键是通过对象计算出来的字符串
 	Get(obj interface{}) (item interface{}, exists bool, err error)
 
 	// GetByKey returns the accumulator associated with the given key
@@ -62,15 +63,18 @@ type Store interface {
 	// Replace will delete the contents of the store, using instead the
 	// given list. Store takes ownership of the list, you should not reference
 	// it after calling this function.
+	// []interface{}替换Store存储的所有对象，等同于删除全部原有对象在逐一添加新的对象
 	Replace([]interface{}, string) error
 
 	// Resync is meaningless in the terms appearing here but has
 	// meaning in some implementations that have non-trivial
 	// additional behavior (e.g., DeltaFIFO).
+	// 重新同步缓存
 	Resync() error
 }
 
 // KeyFunc knows how to make a key from an object. Implementations should be deterministic.
+// keyfunc 对象生成键
 type KeyFunc func(obj interface{}) (string, error)
 
 // KeyError will be returned any time a KeyFunc gives an error; it includes the object
@@ -136,11 +140,15 @@ func SplitMetaNamespaceKey(key string) (namespace, name string, err error) {
 
 // `*cache` implements Indexer in terms of a ThreadSafeStore and an
 // associated KeyFunc.
+// 1. 通过 keyFunc函数 计算对象key值
+// 2. 调用 ThreadSafeStorage 线程安全存储的接口 方法实现
 type cache struct {
 	// cacheStorage bears the burden of thread safety for the cache
+	// 线程安全的存储 读写锁实现的map
 	cacheStorage ThreadSafeStore
 	// keyFunc is used to make the key for objects stored in and retrieved from items, and
 	// should be deterministic.
+	// 确定性的key值
 	keyFunc KeyFunc
 }
 
@@ -255,6 +263,7 @@ func (c *cache) Resync() error {
 }
 
 // NewStore returns a Store implemented simply with a map and a lock.
+// 初始化创建是需要执指定计算对象键的函数
 func NewStore(keyFunc KeyFunc) Store {
 	return &cache{
 		cacheStorage: NewThreadSafeStore(Indexers{}, Indices{}),

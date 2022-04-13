@@ -37,21 +37,28 @@ type Indexer interface {
 	// Index returns the stored objects whose set of indexed values
 	// intersects the set of indexed values of the given object, for
 	// the named index
+	// 检索 匹配命名索引函数的对象列表
+	// indexName索引函数名，obj是对象，计算obj在indexName索引函数中的所有索引键，通过索引键把所有的对象取出来
+	// 主要就是获取对象索引键
 	Index(indexName string, obj interface{}) ([]interface{}, error)
 	// IndexKeys returns the storage keys of the stored objects whose
 	// set of indexed values for the named index includes the given
 	// indexed value
+	// 索引函数indexName  中索引键为indexKey 的对象
 	IndexKeys(indexName, indexedValue string) ([]string, error)
 	// ListIndexFuncValues returns all the indexed values of the given index
+	// 列举索引函数 indexName 所有的索引键
 	ListIndexFuncValues(indexName string) []string
 	// ByIndex returns the stored objects whose set of indexed values
 	// for the named index includes the given indexed value
+	// 返回值不是对象键，而是所有对象
 	ByIndex(indexName, indexedValue string) ([]interface{}, error)
 	// GetIndexer return the indexers
 	GetIndexers() Indexers
 
 	// AddIndexers adds more indexers to this store.  If you call this after you already have data
 	// in the store, the results are undefined.
+	// 在存储中添加更多的indexers，增加更多的索引函数
 	AddIndexers(newIndexers Indexers) error
 }
 
@@ -78,7 +85,7 @@ func IndexFuncToKeyFuncAdapter(indexFunc IndexFunc) KeyFunc {
 }
 
 const (
-	// NamespaceIndex is the lookup name for the most common index function, which is to index by the namespace field.
+	// NamespaceIndex is the lookup name for the most comment index function, which is to index by the namespace field.
 	NamespaceIndex string = "namespace"
 )
 
@@ -94,7 +101,7 @@ func MetaNamespaceIndexFunc(obj interface{}) ([]string, error) {
 // Index maps the indexed value to a set of keys in the store that match on that value
 type Index map[string]sets.String
 
-// Indexers maps a name to an IndexFunc
+// Indexers maps a name to a IndexFunc
 type Indexers map[string]IndexFunc
 
 // Indices maps a name to an Index
