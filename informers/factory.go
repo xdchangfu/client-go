@@ -53,16 +53,24 @@ import (
 type SharedInformerOption func(*sharedInformerFactory) *sharedInformerFactory
 
 type sharedInformerFactory struct {
+	// clientset，支持直接请求 api 中各内置资源对象的 restful group 客户端集合
 	client           kubernetes.Interface
 	namespace        string
 	tweakListOptions internalinterfaces.TweakListOptionsFunc
 	lock             sync.Mutex
-	defaultResync    time.Duration
-	customResync     map[reflect.Type]time.Duration
 
+	// 用于初始化持有的 shareIndexInformer 的 resyncCheckPeriod 和 defaultEventHandlerResyncPeriod 字段，
+	// 用于定时的将 local store 同步到 deltaFIFO
+	defaultResync time.Duration
+	// 支持针对每一个 informer 来配置 resync 时间，通过 WithCustomResyncConfig 这个 Option 配置，
+	// 否则就用指定的 defaultResync
+	customResync map[reflect.Type]time.Duration
+
+	// factory 管理的 informer 集合
 	informers map[reflect.Type]cache.SharedIndexInformer
 	// startedInformers is used for tracking which informers have been started.
 	// This allows Start() to be called multiple times safely.
+	// 记录已经启动的 informer 集合
 	startedInformers map[reflect.Type]bool
 }
 
@@ -108,6 +116,7 @@ func NewFilteredSharedInformerFactory(client kubernetes.Interface, defaultResync
 // NewSharedInformerFactoryWithOptions constructs a new instance of a SharedInformerFactory with additional options.
 func NewSharedInformerFactoryWithOptions(client kubernetes.Interface, defaultResync time.Duration, options ...SharedInformerOption) SharedInformerFactory {
 	factory := &sharedInformerFactory{
+		// clientset，对原生资源来说，这里可以直接使用kube clientset
 		client:           client,
 		namespace:        v1.NamespaceAll,
 		defaultResync:    defaultResync,
@@ -131,6 +140,7 @@ func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
 
 	for informerType, informer := range f.informers {
 		if !f.startedInformers[informerType] {
+			// 直接起gorouting调用informer的Run方法，并且标记对应的informer已经启动
 			go informer.Run(stopCh)
 			f.startedInformers[informerType] = true
 		}
@@ -139,6 +149,7 @@ func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
 
 // WaitForCacheSync waits for all started informers' cache were synced.
 func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool {
+	// 获取每一个已经启动的informer
 	informers := func() map[reflect.Type]cache.SharedIndexInformer {
 		f.lock.Lock()
 		defer f.lock.Unlock()
@@ -152,6 +163,7 @@ func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[ref
 		return informers
 	}()
 
+	// 等待他们的cache被同步，调用的是informer的HasSynced方法
 	res := map[reflect.Type]bool{}
 	for informType, informer := range informers {
 		res[informType] = cache.WaitForCacheSync(stopCh, informer.HasSynced)
@@ -161,21 +173,24 @@ func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[ref
 
 // InternalInformerFor returns the SharedIndexInformer for obj using an internal
 // client.
+// 向factory中注册指定的informer
 func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internalinterfaces.NewInformerFunc) cache.SharedIndexInformer {
 	f.lock.Lock()
 	defer f.lock.Unlock()
-
+	// 根据对象类型判断factory中是否已经有对应informer
 	informerType := reflect.TypeOf(obj)
 	informer, exists := f.informers[informerType]
 	if exists {
 		return informer
 	}
 
+	// 如果factory中已经有这个对象类型的informer，就不创建了
 	resyncPeriod, exists := f.customResync[informerType]
 	if !exists {
 		resyncPeriod = f.defaultResync
 	}
 
+	// 没有就根据newFunc创建一个，并存在map中
 	informer = newFunc(f.client, resyncPeriod)
 	f.informers[informerType] = informer
 

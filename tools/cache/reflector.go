@@ -255,6 +255,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 	klog.V(3).Infof("Listing and watching %v from %s", r.expectedTypeName, r.name)
 	var resourceVersion string
 
+	// 以版本号ResourceVersion=0开始首次list
 	options := metav1.ListOptions{ResourceVersion: r.relistResourceVersion()}
 
 	if err := func() error {
@@ -344,13 +345,19 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		if err != nil {
 			return fmt.Errorf("unable to understand list result %#v: %v", list, err)
 		}
+
+		// 根据结果更新版本号，用于接下来的watch
 		resourceVersion = listMetaInterface.GetResourceVersion()
 		initTrace.Step("Resource version extracted")
 		items, err := meta.ExtractList(list)
+
 		if err != nil {
 			return fmt.Errorf("unable to understand list result %#v (%v)", list, err)
 		}
 		initTrace.Step("Objects extracted")
+
+		// 这里的syncWith是把首次list到的结果通过DeltaFIFO的Replce方法批量添加到队列
+		// 队列提供了Resync方法用于判断Replace批量插入的对象是否都pop出去了，factory/informer的WaitForCacheSync就是调用了DeltaFIFO的的Resync方法
 		if err := r.syncWith(items, resourceVersion); err != nil {
 			return fmt.Errorf("unable to sync list result: %v", err)
 		}
@@ -366,6 +373,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 	cancelCh := make(chan struct{})
 	defer close(cancelCh)
 	go func() {
+		// 获取一个定时channel，定时的时间是创建informer factory时传入的resyncPeriod
 		resyncCh, cleanup := r.resyncChan()
 		defer func() {
 			cleanup() // Call the last one written into cleanup
@@ -390,6 +398,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		}
 	}()
 
+	// 以list对象中获取的ResourceVersion不断watch
 	for {
 		// give the stopCh a chance to stop the loop, even in case of continue statements further down on errors
 		select {
@@ -426,6 +435,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			return err
 		}
 
+		// watchhandler处理watch到的数据，即把对象根据watch.type增加到DeltaFIFO中
 		if err := r.watchHandler(start, w, &resourceVersion, resyncerrc, stopCh); err != nil {
 			if err != errorStopRequested {
 				switch {

@@ -125,18 +125,21 @@ func New(c *Config) Controller {
 // Run begins processing items, and will continue until a value is sent down stopCh or it is closed.
 // It's an error to call Run more than once.
 // Run blocks; call via go.
+// 更多字段的配置是在Run的时候
 func (c *controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	go func() {
 		<-stopCh
 		c.config.Queue.Close()
 	}()
+	// 使用config创建一个Reflector
 	r := NewReflector(
 		c.config.ListerWatcher,
 		c.config.ObjectType,
 		c.config.Queue,
 		c.config.FullResyncPeriod,
 	)
+	// 来自sharedProcessor的方法
 	r.ShouldResync = c.config.ShouldResync
 	r.WatchListPageSize = c.config.WatchListPageSize
 	r.clock = c.clock
@@ -149,9 +152,9 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 	c.reflectorMutex.Unlock()
 
 	var wg wait.Group
-
+	// 启动reflector，执行ListWatch方法
 	wg.StartWithChannel(stopCh, r.Run)
-
+	// 不断执行processLoop，这个方法其实就是从DeltaFIFO pop出对象，再调用reflector的Process（其实是shareIndexInformer的HandleDeltas方法）处理
 	wait.Until(c.processLoop, time.Second, stopCh)
 	wg.Wait()
 }
@@ -429,6 +432,7 @@ func processDeltas(
 
 		switch d.Type {
 		case Sync, Replaced, Added, Updated:
+			// 对象先通过shareIndexInformer中的indexer更新到缓存
 			if old, exists, err := clientState.Get(obj); err == nil && exists {
 				if err := clientState.Update(obj); err != nil {
 					return err

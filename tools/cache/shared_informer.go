@@ -300,9 +300,11 @@ func WaitForCacheSync(stopCh <-chan struct{}, cacheSyncs ...InformerSynced) bool
 // sharedProcessor, which is responsible for relaying those
 // notifications to each of the informer's clients.
 type sharedIndexInformer struct {
-	indexer    Indexer
+	// informer中的底层缓存cache
+	indexer Indexer
+	// 持有reflector和deltaFIFO对象，reflector对象将会listWatch对象添加到deltaFIFO，同时更新indexer cahce，更新成功则通过sharedProcessor触发用户配置的Eventhandler
 	controller Controller
-
+	// 持有一系列的listener，每个listener对应用户的EventHandler
 	processor             *sharedProcessor
 	cacheMutationDetector MutationDetector
 
@@ -401,19 +403,24 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		klog.Warningf("The sharedIndexInformer has started, run more than once is not allowed")
 		return
 	}
+	// 创建一个DeltaFIFO，用于shareIndexInformer.controller.reflector
+	// 可以看到这里把indexer即本地缓存传入，用来初始化deltaFIFO的knownObject字段
 	fifo := NewDeltaFIFOWithOptions(DeltaFIFOOptions{
 		KnownObjects:          s.indexer,
 		EmitDeltaTypeReplaced: true,
 	})
 
+	// shareIndexInformer中的controller的配置
 	cfg := &Config{
 		Queue:            fifo,
 		ListerWatcher:    s.listerWatcher,
 		ObjectType:       s.objectType,
 		FullResyncPeriod: s.resyncCheckPeriod,
 		RetryOnError:     false,
-		ShouldResync:     s.processor.shouldResync,
+		// 这个 shouldResync方法将被用在reflector ListAndWatch方法中判断定时时间resyncCheckPeriod到了之后该不该进行resync动作
+		ShouldResync: s.processor.shouldResync,
 
+		// 一个知道如何处理从informer中的controller中的deltaFIFO pop出来的对象的方法
 		Process:           s.HandleDeltas,
 		WatchErrorHandler: s.watchErrorHandler,
 	}
@@ -421,7 +428,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	func() {
 		s.startedLock.Lock()
 		defer s.startedLock.Unlock()
-
+		// 这里New一个具体的controller
 		s.controller = New(cfg)
 		s.controller.(*controller).clock = s.clock
 		s.started = true
@@ -433,6 +440,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	defer wg.Wait()              // Wait for Processor to stop
 	defer close(processorStopCh) // Tell Processor to stop
 	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run)
+	// 调用processor.run启动所有的listener，回调用户配置的EventHandler
 	wg.StartWithChannel(processorStopCh, s.processor.run)
 
 	defer func() {
@@ -617,9 +625,18 @@ func (s *sharedIndexInformer) OnDelete(old interface{}) {
 // calls to shouldResync and (b) every listener is initially put in.
 // The non-sync distributions go to every listener.
 type sharedProcessor struct {
+	// listeners中包含的listener是否都已经启动了
 	listenersStarted bool
 	listenersLock    sync.RWMutex
-	listeners        []*processorListener
+
+	/*
+		listeners：记录了informer添加的所有listener
+		syncingListeners：记录了informer中哪些listener处于sync状态
+		syncingListeners 是listeners的子集，syncingListeners记录那些开启了resync且时间已经到达了的listener
+	*/
+	// 已添加的listener列表，用来处理watch到的数据
+	listeners []*processorListener
+	// 已添加的listener列表，用来处理list或者resync的数据
 	syncingListeners []*processorListener
 	clock            clock.Clock
 	wg               wait.Group
@@ -637,6 +654,8 @@ func (p *sharedProcessor) addListener(listener *processorListener) {
 }
 
 func (p *sharedProcessor) addListenerLocked(listener *processorListener) {
+	// 同时添加到listeners和syncingListeners列表，但其实添加的是同一个对象的引用
+	// 所以下面run启动的时候只需要启动listeners中listener就可以了
 	p.listeners = append(p.listeners, listener)
 	p.syncingListeners = append(p.syncingListeners, listener)
 }
@@ -645,7 +664,9 @@ func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
 	p.listenersLock.RLock()
 	defer p.listenersLock.RUnlock()
 
+	// 如果是通过reflector list Replace到deltaFIFO的对象或者reflector定时触发resync到deltaFIFO的对象，那么distribute到syncingListeners
 	if sync {
+		// 保证deltaFIFO Resync方法过来的delta obj只给开启了resync能力的listener
 		for _, listener := range p.syncingListeners {
 			listener.add(obj)
 		}
@@ -661,7 +682,9 @@ func (p *sharedProcessor) run(stopCh <-chan struct{}) {
 		p.listenersLock.RLock()
 		defer p.listenersLock.RUnlock()
 		for _, listener := range p.listeners {
+			// listener的run方法不断的从listener自身的缓冲区取出对象回调handler
 			p.wg.Start(listener.run)
+			// listener的pop方法不断的接收对象并暂存在自身的缓冲区中
 			p.wg.Start(listener.pop)
 		}
 		p.listenersStarted = true
@@ -681,6 +704,7 @@ func (p *sharedProcessor) shouldResync() bool {
 	p.listenersLock.Lock()
 	defer p.listenersLock.Unlock()
 
+	// 这里每次都会先置空列表，保证里面记录了当前需要resync的listener
 	p.syncingListeners = []*processorListener{}
 
 	resyncNeeded := false
@@ -690,6 +714,7 @@ func (p *sharedProcessor) shouldResync() bool {
 		// listeners that are going to be resyncing.
 		if listener.shouldResync(now) {
 			resyncNeeded = true
+			// 达到resync条件的listener被加入syncingListeners
 			p.syncingListeners = append(p.syncingListeners, listener)
 			listener.determineNextResync(now)
 		}
@@ -719,8 +744,12 @@ func (p *sharedProcessor) resyncCheckPeriodChanged(resyncCheckPeriod time.Durati
 // processorListener also keeps track of the adjusted requested resync
 // period of the listener.
 type processorListener struct {
+	// 无缓冲的chan，listener的run方法不断从nextCh取出对象回调用户handler。
+	// nextCh的对象来源于addCh或者缓冲区
 	nextCh chan interface{}
-	addCh  chan interface{}
+	// 无缓冲的chan，listener的pop方法不断从addCh取出对象丢给nextCh
+	// addCh中的对象来源于listener的add方法，如果nextCh不能及时消费，则放入缓冲区pendingNotifications
+	addCh chan interface{}
 
 	handler ResourceEventHandler
 
@@ -729,6 +758,7 @@ type processorListener struct {
 	// added until we OOM.
 	// TODO: This is no worse than before, since reflectors were backed by unbounded DeltaFIFOs, but
 	// we should try to do something better.
+	// 一个无容量限制的环形缓冲区，可以理解为可以无限存储的队列，用来存储deltaFIFO分发过来的消息
 	pendingNotifications buffer.RingGrowing
 
 	// requestedResyncPeriod is how frequently the listener wants a
@@ -739,6 +769,7 @@ type processorListener struct {
 	// in AddEventHandlerWithResyncPeriod invocations made after the
 	// sharedIndexInformer starts and (b) only if the informer does
 	// resyncs at all.
+	// informer希望listener多长时间进行resync
 	requestedResyncPeriod time.Duration
 	// resyncPeriod is the threshold that will be used in the logic
 	// for this listener.  This value differs from
@@ -747,8 +778,10 @@ type processorListener struct {
 	// actual time between resyncs depends on when the
 	// sharedProcessor's `shouldResync` function is invoked and when
 	// the sharedIndexInformer processes `Sync` type Delta objects.
+	// listener自身期待多长时间进行resync
 	resyncPeriod time.Duration
 	// nextResync is the earliest time the listener should get a full resync
+	// 由resyncPeriod和requestedResyncPeriod计算得出，与当前时间now比较判断listener是否该进行resync了
 	nextResync time.Time
 	// resyncLock guards access to resyncPeriod and nextResync
 	resyncLock sync.Mutex
@@ -770,6 +803,7 @@ func newProcessListener(handler ResourceEventHandler, requestedResyncPeriod, res
 }
 
 func (p *processorListener) add(notification interface{}) {
+	// 虽然p.addCh是一个无缓冲的channel，但是因为listener中存在ring buffer，所以这里并不会一直阻塞
 	p.addCh <- notification
 }
 
@@ -777,32 +811,41 @@ func (p *processorListener) pop() {
 	defer utilruntime.HandleCrash()
 	defer close(p.nextCh) // Tell .run() to stop
 
+	// nextCh 没有利用make初始化，将阻塞在读和写上
 	var nextCh chan<- interface{}
+	// notification 初始值为nil
 	var notification interface{}
 	for {
 		select {
+		// 执行这个case，相当于给p.nextCh添加来自p.addCh的内容
 		case nextCh <- notification:
 			// Notification dispatched
 			var ok bool
+			// 前面的notification已经加到p.nextCh了， 为下一次这个case再次ready做准备
 			notification, ok = p.pendingNotifications.ReadOne()
 			if !ok { // Nothing to pop
 				nextCh = nil // Disable this select case
 			}
+		// 第一次select只有这个case ready
 		case notificationToAdd, ok := <-p.addCh:
 			if !ok {
 				return
 			}
 			if notification == nil { // No notification to pop (and pendingNotifications is empty)
 				// Optimize the case - skip adding to pendingNotifications
+				// 为notification 赋值
 				notification = notificationToAdd
+				// 唤醒第一个case
 				nextCh = p.nextCh
 			} else { // There is already a notification waiting to be dispatched
+				// select没有命中第一个case，那么notification就没有被消耗，那么把从p.addCh获取的对象加到缓存中
 				p.pendingNotifications.WriteOne(notificationToAdd)
 			}
 		}
 	}
 }
 
+// listener的run方法不断的从nextCh中获取notification，并根据notification的类型来调用用户自定的EventHandler
 func (p *processorListener) run() {
 	// this call blocks until the channel is closed.  When a panic happens during the notification
 	// we will catch it, **the offending item will be skipped!**, and after a short delay (one second)
@@ -813,6 +856,7 @@ func (p *processorListener) run() {
 		for next := range p.nextCh {
 			switch notification := next.(type) {
 			case updateNotification:
+				// 回调用户配置的handler
 				p.handler.OnUpdate(notification.oldObj, notification.newObj)
 			case addNotification:
 				p.handler.OnAdd(notification.newObj)

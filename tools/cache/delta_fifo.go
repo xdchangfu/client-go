@@ -101,25 +101,31 @@ type DeltaFIFO struct {
 
 	// `items` maps a key to a Deltas.
 	// Each such Deltas has at least one Delta.
+	// 记录deltaFIFO中的对象，注意map的value是一个delta slice
 	items map[string]Deltas
 
 	// `queue` maintains FIFO order of keys for consumption in Pop().
 	// There are no duplicates in `queue`.
 	// A key is in `queue` if and only if it is in `items`.
+	// 记录上面items中的key，维护对象的fifo顺序
 	queue []string
 
 	// populated is true if the first batch of items inserted by Replace() has been populated
 	// or Delete/Add/Update/AddIfNotPresent was called first.
+	// 队列中是否填充过数据，LIST时调用Replace或调用Delete/Add/Update都会置为true
 	populated bool
 	// initialPopulationCount is the number of items inserted by the first call of Replace()
+	// 首次List的时候获取到的数据就会调用Replace批量增加到队列，同时设置initialPopulationCount为List到的对象数量，每次Pop出来会减一，用于判断是否把首次批量插入的数据都POP出去了
 	initialPopulationCount int
 
 	// keyFunc is used to make the key used for queued item
 	// insertion and retrieval, and should be deterministic.
+	// 知道怎么从对象中解析出对应key的函数，如MetaNamespaceKeyFunc可以解析出namespace/name的形式
 	keyFunc KeyFunc
 
 	// knownObjects list keys that are "known" --- affecting Delete(),
 	// Replace(), and Resync()
+	// 这个其实就是shareIndexInformer中的indexer底层缓存的引用，可以认为和etcd中的数据一致
 	knownObjects KeyListerGetter
 
 	// Used to indicate a queue is closed so a control loop can exit when a queue is empty.
@@ -372,6 +378,8 @@ func dedupDeltas(deltas Deltas) Deltas {
 	if n < 2 {
 		return deltas
 	}
+
+	// 每次取最后两个delta来判断
 	a := &deltas[n-1]
 	b := &deltas[n-2]
 	if out := isDup(a, b); out != nil {
@@ -385,6 +393,7 @@ func dedupDeltas(deltas Deltas) Deltas {
 // Otherwise, returns nil.
 // TODO: is there anything other than deletions that need deduping?
 func isDup(a, b *Delta) *Delta {
+	// 当前认为只有连续的两个Delete delta才有必要去重
 	if out := isDeletionDup(a, b); out != nil {
 		return out
 	}
@@ -398,6 +407,7 @@ func isDeletionDup(a, b *Delta) *Delta {
 		return nil
 	}
 	// Do more sophisticated checks, or is this sufficient?
+	// 优先去重DeletedFinalStateUnknown类型的Deleted delta
 	if _, ok := b.Object.(DeletedFinalStateUnknown); ok {
 		return a
 	}
@@ -406,16 +416,20 @@ func isDeletionDup(a, b *Delta) *Delta {
 
 // queueActionLocked appends to the delta list for the object.
 // Caller must lock first.
+// 在队列中给指定的对象append一个Delta
 func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
 	id, err := f.KeyOf(obj)
 	if err != nil {
 		return KeyError{obj, err}
 	}
+	// 把增量append到slice的后面
 	oldDeltas := f.items[id]
 	newDeltas := append(oldDeltas, Delta{actionType, obj})
+	// 连续的两个Deleted delta将会去掉一个
 	newDeltas = dedupDeltas(newDeltas)
 
 	if len(newDeltas) > 0 {
+		// 维护queue队列
 		if _, exists := f.items[id]; !exists {
 			f.queue = append(f.queue, id)
 		}
@@ -526,9 +540,12 @@ func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
 
 			f.cond.Wait()
 		}
+		// 取出队首元素
 		id := f.queue[0]
+		// 去掉队首元素
 		f.queue = f.queue[1:]
 		depth := len(f.queue)
+		// 首次填充的对象数减一
 		if f.initialPopulationCount > 0 {
 			f.initialPopulationCount--
 		}
@@ -551,7 +568,9 @@ func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
 				utiltrace.Field{Key: "Reason", Value: "slow event handlers blocking the queue"})
 			defer trace.LogIfLong(100 * time.Millisecond)
 		}
+		// 处理增量对象
 		err := process(item)
+		// 如果没有处理成功，那么就会重新加到deltaFIFO队列中
 		if e, ok := err.(ErrRequeue); ok {
 			f.addIfNotPresent(id, item)
 			err = e.Err
@@ -590,11 +609,14 @@ func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
 			return KeyError{item, err}
 		}
 		keys.Insert(key)
+		// 调用deltaFIFO的queueActionLocked向deltaFIFO增加一个增量
+		// 可以看到Replace添加的Delta type都是Sync
 		if err := f.queueActionLocked(action, item); err != nil {
 			return fmt.Errorf("couldn't enqueue object: %v", err)
 		}
 	}
 
+	// 底层的缓存不应该会是nil，可以忽略这种情况
 	if f.knownObjects == nil {
 		// Do deletion detection against our own list.
 		queuedDeletions := 0
@@ -605,6 +627,7 @@ func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
 			// Delete pre-existing items not in the new list.
 			// This could happen if watch deletion event was missed while
 			// disconnected from apiserver.
+			// 当 knownObjects 为空时，如果item中存在对象不在新来的list中，那么该对象被认为要被删除
 			var deletedObj interface{}
 			if n := oldItem.Newest(); n != nil {
 				deletedObj = n.Object
@@ -626,13 +649,21 @@ func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
 	}
 
 	// Detect deletions not already in the queue.
+	// 当reflector发生re-list时，可能会出现knownObjects中存在的对象不在Replace list的情况
 	knownKeys := f.knownObjects.ListKeys()
+	// 记录这次替换相当于在缓存中删除多少对象
 	queuedDeletions := 0
+	// 枚举local store中的所有对象
 	for _, k := range knownKeys {
+		// 对象也在Replace list中，所以跳过
 		if keys.Has(k) {
 			continue
 		}
 
+		// 对象在缓存，但不在list中，说明替换操作完成后，这个对象相当于被删除了
+		// 注意这里的所谓替换，对deltaFIFO来说，是给队列中的对应对象增加一个
+		// delete增量queueActionLocked(Deleted, DeletedFinalStateUnknown{k, deletedObj})
+		// 真正删除缓存需要等到DeletedFinalStateUnknown增量被POP出来操作local store时
 		deletedObj, exists, err := f.knownObjects.GetByKey(k)
 		if err != nil {
 			deletedObj = nil
@@ -647,6 +678,8 @@ func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
 		}
 	}
 
+	// 设置f.initialPopulationCount，该值大于0表示首次插入的对象还没有全部pop出去
+	// informer WaitForCacheSync就是在等待该值为0
 	if !f.populated {
 		f.populated = true
 		f.initialPopulationCount = keys.Len() + queuedDeletions
@@ -667,6 +700,7 @@ func (f *DeltaFIFO) Resync() error {
 	}
 
 	keys := f.knownObjects.ListKeys()
+	// 把local store中的对象都以Sync类型增量的形式重新放回到deltaFIFO
 	for _, k := range keys {
 		if err := f.syncKeyLocked(k); err != nil {
 			return err
@@ -693,10 +727,16 @@ func (f *DeltaFIFO) syncKeyLocked(key string) error {
 	if err != nil {
 		return KeyError{obj, err}
 	}
+
+	// 如果deltaFIFO中该对象还有增量没有处理，则忽略以避免冲突，原因如上面注释：在同一个对象的增量列表中，排在后面的增量的object相比前面的增量应该更新才是合理的
+	// 如上述注释，在resync时，如果deltaFIFO中该对象还存在其他delta没处理，那么忽略这次的resync
+	// 因为调用queueActionLocked是增加delta是通过append的，且处理对象的增量delta时，是从oldest到newdest的
+	// 所以如果某个对象还存在增量没处理，再append就可能导致后处理的delta是旧的对象
 	if len(f.items[id]) > 0 {
 		return nil
 	}
 
+	// 跟deltaFIFO的Replace方法一样，都是添加一个Sync类型的增量
 	if err := f.queueActionLocked(Sync, obj); err != nil {
 		return fmt.Errorf("couldn't queue object: %v", err)
 	}

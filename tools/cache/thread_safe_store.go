@@ -303,7 +303,9 @@ func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, ke
 			c.indices[name] = index
 		}
 
+		// 索引函数计算出多个value，也可能是一个，比如pod的ns就只有一个值，pod的label可能就有多个值
 		for _, indexValue := range indexValues {
+			// 比如namespace索引，根据indexValue=default，获取default对应的集合再把当前对象插入
 			set := index[indexValue]
 			if set == nil {
 				set = sets.String{}
